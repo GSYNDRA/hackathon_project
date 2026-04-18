@@ -1,3 +1,4 @@
+const crypto = require('crypto');
 const courseService = require('../services/courseService');
 const { broadcastToCourse } = require('../utils/websocket');
 
@@ -111,11 +112,17 @@ class CourseController {
         return res.status(400).json({ error: 'Questions array is required' });
       }
       
+      const answerKey = questions.map(q => q.correct_answer_idx);
+      const answerKeyBuffer = Buffer.from(answerKey);
+      const answerHash = crypto.createHash('sha256').update(answerKeyBuffer).digest();
+      
       const createdQuestions = await courseService.createExamQuestions(id, questions);
       
       res.json({
         success: true,
-        questions_count: createdQuestions.length
+        questions_count: createdQuestions.length,
+        answer_hash: Array.from(answerHash),
+        answer_hash_hex: answerHash.toString('hex')
       });
     } catch (error) {
       console.error('Create exam error:', error);

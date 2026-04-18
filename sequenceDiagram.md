@@ -1584,3 +1584,56 @@ Sequence Diagram
 | 7 | **Teacher Reveals & Scores** | Teacher confirms answer key | EXAM_ACTIVE → SCORED |
 | 8 | **Distribute Rewards** | Anyone clicks "Distribute Rewards" | SCORED → REWARDS_DISTRIBUTED |
 | 9 | **View Results** | Anyone navigates to results page | Read-only display |
+
+
+Phase 2: Backend
+Step	File	What to Do
+2.1	.env	Add SUI_NETWORK=testnet, SUI_RPC_URL=https://fullnode.testnet.sui.io:443, PLATFORM_OBJECT_ID=<from step 1.15>
+2.2	config/index.js or config/config.js	Add these new env vars to config export
+2.3	services/suiService.js (NEW)	Create Sui client service: (1) Initialize SuiClient with testnet RPC URL, (2) getObject(objectId) — generic object fetch, (3) isTeacherOnChain(platformId, address) — reads Platform object, checks if address in teachers VecSet, (4) isStudentOnChain(platformId, address) — same for students, (5) getOnChainRole(platformId, address) — returns "teacher" / "student" / null, (6) verifyRegistrationTx(txDigest, expectedRole) — fetches TX events, verifies TeacherRegistered or StudentRegistered event exists
+2.4	services/userService.js	Modify createUser: (1) Accept optional tx_digest param, (2) If tx_digest provided, call suiService.verifyRegistrationTx(txDigest, role) to verify on-chain, (3) If role mismatch between request and on-chain → throw 409 error, (4) Proceed with DB insert as before
+2.5	controllers/userController.js	Modify register: (1) Accept tx_digest from req.body (optional), (2) Pass to userService.createUser, (3) Handle 409 role mismatch error
+2.6	routes/index.js	Add GET /users/:address/on-chain-role route → new controller method
+2.7	controllers/userController.js	Add getOnChainRole(req, res): (1) Get address from params, (2) Call suiService.getOnChainRole(PLATFORM_OBJECT_ID, address), (3) Return { role, source: "on-chain" }
+2.8	services/userService.js	Modify getUserRole: (1) First check DB, (2) If null in DB, fallback to suiService.getOnChainRole(platformId, address), (3) If on-chain found, auto-sync to DB via findOrCreate, (4) Return role
+2.9	middleware/roleGuard.js (NEW)	Create role enforcement middleware: (1) requireTeacher — reads wallet_address from header, calls userService.getUserRole, if not "teacher" → 403, (2) requireStudent — same for "student"
+2.10	routes/index.js	Apply middleware to role-restricted routes: requireTeacher on POST /courses, POST /courses/:id/exam, POST /courses/:id/start, etc. requireStudent on POST /courses/:course_id/enroll, POST /courses/:course_id/submit
+2.11	Terminal	npm run dev — verify server starts, test GET /api/users/:address/role, GET /api/users/:address/on-chain-role, POST /api/users/register with tx_digest
+---
+Phase 3: Frontend
+Step	File	What to Do
+3.1	src/config/contracts.js (NEW)	Create config file: export const PACKAGE_ID = '0x...', export const PLATFORM_OBJECT_ID = '0x...', export const MODULE_NAME = 'course' (placeholder IDs, fill after deploy)
+3.2	src/services/api.js	Rewrite using axios (already in package.json). Add: registerUser(walletAddress, role, txDigest), getUserRole(address) (already exists), getUserProfile(address), getOnChainRole(address)
+3.3	src/hooks/useTransactions.js (NEW)	Create hook using @mysten/dapp-kit's useSignAndExecuteTransaction and useSuiClient. Expose: registerAsTeacher() — builds PTB calling course::register_as_teacher(Platform), registerAsStudent() — builds PTB calling course::register_as_student(Platform). Both return { digest, success } after confirmation
+3.4	src/contexts/RoleContext.jsx	Major rewrite: (1) Add selectTeacherRole() — calls registerAsTeacher(), on success calls registerUser(addr, 'teacher', digest), then setRole('teacher'); (2) Add selectStudentRole() — same but 'student'; (3) Modify checkExistingRole() — first check DB via getUserRole(addr), if null fallback to getOnChainRole(addr), if on-chain found auto-sync to DB via registerUser(addr, role, null); (4) Add isRegistering state for loading during TX; (5) Add txError state for on-chain errors; (6) Store role in localStorage for persistence
+3.5	src/components/RoleSelector.jsx (NEW)	Create unified role selection component: (1) If !isConnected → show ConnectButton; (2) If connected + !hasRole + !isRegistering → show role selector with Teacher/Student buttons + permanent warning; (3) If isRegistering → show "Confirming on blockchain..." spinner; (4) If hasRole → auto-redirect based on role. Style: clean card layout, warning icon for permanence
+3.6	src/components/TeacherSetup.jsx	Delete or rewrite to just re-export RoleSelector. This file is no longer needed as the landing page
+3.7	src/App.jsx	Update routes: / → RoleSelector, /teacher → TeacherPage (with role guard), /student → StudentPage (with role guard). Add a simple ProtectedRoute component that checks role from RoleContext and redirects accordingly
+3.8	src/pages/HomePage.jsx	Delete or repurpose as redirect: if teacher → /teacher, if student → /student, if !role → /
+3.9	src/contexts/WalletContext.jsx	Add disconnect handler: when wallet disconnects, clear localStorage role and reset RoleContext state
+3.10	src/index.css	Add styles for RoleSelector: button styles, warning box, loading spinner, error message
+---
+Phase 4: Integration Testing (End-to-End)
+Step	What to Test	How
+4.1	Deploy contract to testnet	sui client publish — note PACKAGE_ID and PLATFORM_OBJECT_ID
+4.2	Update config files	Set IDs in contracts.js (frontend) and .env (backend)
+4.3	Start all services	Backend npm run dev, Frontend npm run dev, PostgreSQL docker-compose up -d
+4.4	Open app with fresh wallet	Should see "Connect Wallet"
+4.5	Connect wallet, no role on-chain or DB	Should see Role Selector with Teacher/Student buttons
+4.6	Click "Teacher"	Sui wallet popup → approve TX → "Confirming on blockchain..." → success → redirect to /teacher
+4.7	Check on-chain: sui client object <PLATFORM_OBJECT_ID>	Should show wallet address in teachers VecSet, NOT in students
+4.8	Check DB: SELECT * FROM user_profiles WHERE wallet_address = '0x...'	Should show role = "teacher"
+4.9	Refresh page	Should auto-detect role from DB → redirect to /teacher (no role selector)
+4.10	Disconnect, connect different wallet	See Role Selector again
+4.11	Click "Student"	TX → success → redirect to /student
+4.12	Try navigating to /student with the Teacher wallet	ProtectedRoute redirects to /teacher
+4.13	Try register_as_student(Platform) from Teacher wallet on Sui CLI	TX aborts: E_ALREADY_TEACHER
+4.14	Try create_course(Platform, ...) from Student wallet on Sui CLI	TX aborts: E_WRONG_ROLE_TEACHER
+4.15	Delete the Teacher's row from user_profiles in DB, then refresh	Backend falls back to on-chain check → finds teacher role → auto-syncs to DB → redirects to /teacher
+4.16	Try POST /api/courses (teacher action) with Student wallet address in header	Backend roleGuard returns 403 Forbidden
+---
+Critical Questions Before Starting
+1. Platform object creation: The init function auto-creates the Platform shared object on publish. This means only one Platform per deployment. Is this acceptable, or should teachers be able to create their own Platform (multi-tenant)?
+2. Admin role: Should there be an AdminCap capability to remove users from roles (for moderation), or is "permanent" really permanent for this MVP? Dont need
+3. Username input: In the role selector, should we prompt for a username before registration, or auto-generate one (e.g., truncated wallet address)? auto-generate one
+Shall I proceed with implementation after you answer these?

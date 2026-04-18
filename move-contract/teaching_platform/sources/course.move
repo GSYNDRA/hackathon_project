@@ -1,12 +1,14 @@
+#[allow(unused_const, unused_field, duplicate_alias)]
 module teaching_platform::course {
     use sui::balance::{Self as balance};
     use sui::coin::{Self as coin};
     use sui::event;
-    use sui::object::{Self as object};
+    use sui::object;
     use sui::sui::SUI;
     use sui::table::{Self as table};
     use sui::transfer;
-    use sui::tx_context::{Self as tx_context};
+    use sui::tx_context;
+    use sui::vec_set::{Self as vec_set};
     use std::string::{Self as string};
 
     const ENROLLING: u8 = 0;
@@ -19,24 +21,35 @@ module teaching_platform::course {
     const MAX_ALLOWED_STUDENTS: u8 = 5;
     const ANSWER_HASH_LENGTH: u64 = 32;
 
-    const E_INSUFFICIENT_PAYMENT: u64 = 0;
-    const E_ALREADY_ENROLLED: u64 = 1;
-    const E_COURSE_FULL: u64 = 2;
-    const E_NOT_TEACHER: u64 = 3;
-    const E_NOT_ENROLLED: u64 = 4;
-    const E_EXAM_NOT_ACTIVE: u64 = 5;
-    const E_ALREADY_SUBMITTED: u64 = 6;
-    const E_TIME_EXPIRED: u64 = 7;
-    const E_NOT_SCORED: u64 = 8;
-    const E_ALREADY_DISTRIBUTED: u64 = 9;
-    const E_ANSWER_HASH_MISMATCH: u64 = 10;
-    const E_INVALID_STATUS: u64 = 11;
-    const E_INVALID_STUDENT_LIMITS: u64 = 12;
-    const E_INVALID_DURATION: u64 = 13;
-    const E_INVALID_ANSWER_HASH: u64 = 14;
-    const E_INVALID_TUITION: u64 = 15;
-    const E_INVALID_COURSE_NAME: u64 = 16;
-    const E_ENROLLMENT_CLOSED: u64 = 17;
+    const EInsufficientPayment: u64 = 0;
+    const EAlreadyEnrolled: u64 = 1;
+    const ECourseFull: u64 = 2;
+    const ENotTeacher: u64 = 3;
+    const ENotEnrolled: u64 = 4;
+    const EExamNotActive: u64 = 5;
+    const EAlreadySubmitted: u64 = 6;
+    const ETimeExpired: u64 = 7;
+    const ENotScored: u64 = 8;
+    const EAlreadyDistributed: u64 = 9;
+    const EAnswerHashMismatch: u64 = 10;
+    const EInvalidStatus: u64 = 11;
+    const EInvalidStudentLimits: u64 = 12;
+    const EInvalidDuration: u64 = 13;
+    const EInvalidAnswerHash: u64 = 14;
+    const EInvalidTuition: u64 = 15;
+    const EInvalidCourseName: u64 = 16;
+    const EEnrollmentClosed: u64 = 17;
+    const EAlreadyTeacher: u64 = 18;
+    const EAlreadyStudent: u64 = 19;
+    const ENotRegistered: u64 = 20;
+    const EWrongRoleTeacher: u64 = 21;
+    const EWrongRoleStudent: u64 = 22;
+
+    public struct Platform has key {
+        id: object::UID,
+        teachers: vec_set::VecSet<address>,
+        students: vec_set::VecSet<address>,
+    }
 
     public struct Course has key {
         id: object::UID,
@@ -87,6 +100,18 @@ module teaching_platform::course {
         reward_amount: u64,
     }
 
+    public struct PlatformCreated has copy, drop {
+        platform_id: address,
+    }
+
+    public struct TeacherRegistered has copy, drop {
+        teacher: address,
+    }
+
+    public struct StudentRegistered has copy, drop {
+        student: address,
+    }
+
     public struct CourseCreated has copy, drop {
         course_id: address,
         teacher: address,
@@ -109,22 +134,73 @@ module teaching_platform::course {
         duration_ms: u64,
     }
 
+    public fun create_platform(ctx: &mut tx_context::TxContext) {
+        let platform = Platform {
+            id: object::new(ctx),
+            teachers: vec_set::empty(),
+            students: vec_set::empty(),
+        };
+        let platform_id = object::uid_to_address(&platform.id);
+        event::emit(PlatformCreated { platform_id });
+        transfer::share_object(platform);
+    }
+
+    public fun register_as_teacher(
+        platform: &mut Platform,
+        ctx: &mut tx_context::TxContext,
+    ) {
+        let sender = tx_context::sender(ctx);
+        assert!(!vec_set::contains(&platform.students, &sender), EAlreadyStudent);
+        assert!(!vec_set::contains(&platform.teachers, &sender), EAlreadyTeacher);
+        vec_set::insert(&mut platform.teachers, sender);
+        event::emit(TeacherRegistered { teacher: sender });
+    }
+
+    public fun register_as_student(
+        platform: &mut Platform,
+        ctx: &mut tx_context::TxContext,
+    ) {
+        let sender = tx_context::sender(ctx);
+        assert!(!vec_set::contains(&platform.teachers, &sender), EAlreadyTeacher);
+        assert!(!vec_set::contains(&platform.students, &sender), EAlreadyStudent);
+        vec_set::insert(&mut platform.students, sender);
+        event::emit(StudentRegistered { student: sender });
+    }
+
+    public fun is_teacher(platform: &Platform, addr: address): bool {
+        vec_set::contains(&platform.teachers, &addr)
+    }
+
+    public fun is_student(platform: &Platform, addr: address): bool {
+        vec_set::contains(&platform.students, &addr)
+    }
+
+    public fun get_teacher_count(platform: &Platform): u64 {
+        vec_set::length(&platform.teachers)
+    }
+
+    public fun get_student_count(platform: &Platform): u64 {
+        vec_set::length(&platform.students)
+    }
+
     public fun create_course(
+        platform: &Platform,
         name: vector<u8>,
         tuition: u64,
         max_students: u8,
         min_students: u8,
         ctx: &mut tx_context::TxContext,
     ) {
-        assert!(vector::length(&name) > 0u64, E_INVALID_COURSE_NAME);
-        assert!(tuition > 0u64, E_INVALID_TUITION);
+        assert!(is_teacher(platform, tx_context::sender(ctx)), EWrongRoleTeacher);
+        assert!(vector::length(&name) > 0u64, EInvalidCourseName);
+        assert!(tuition > 0u64, EInvalidTuition);
         assert!(
             max_students >= MIN_ALLOWED_STUDENTS && max_students <= MAX_ALLOWED_STUDENTS,
-            E_INVALID_STUDENT_LIMITS,
+            EInvalidStudentLimits,
         );
         assert!(
             min_students > 0u8 && min_students <= max_students,
-            E_INVALID_STUDENT_LIMITS,
+            EInvalidStudentLimits,
         );
 
         let course = Course {
@@ -161,17 +237,19 @@ module teaching_platform::course {
     }
 
     public fun enroll_and_pay(
+        platform: &Platform,
         course: &mut Course,
         payment: coin::Coin<SUI>,
         ctx: &mut tx_context::TxContext,
     ) {
+        assert!(is_student(platform, tx_context::sender(ctx)), EWrongRoleStudent);
         let student = tx_context::sender(ctx);
-        assert!(is_enrollment_open(course), E_ENROLLMENT_CLOSED);
-        assert!(!table::contains(&course.students, student), E_ALREADY_ENROLLED);
-        assert!(course.enrolled_count < (course.max_students as u64), E_COURSE_FULL);
+        assert!(is_enrollment_open(course), EEnrollmentClosed);
+        assert!(!table::contains(&course.students, student), EAlreadyEnrolled);
+        assert!(course.enrolled_count < (course.max_students as u64), ECourseFull);
 
         let payment_amount = coin::value(&payment);
-        assert!(payment_amount == course.tuition, E_INSUFFICIENT_PAYMENT);
+        assert!(payment_amount == course.tuition, EInsufficientPayment);
 
         balance::join(&mut course.escrow, coin::into_balance(payment));
 
@@ -202,10 +280,10 @@ module teaching_platform::course {
         duration_ms: u64,
         ctx: &tx_context::TxContext,
     ) {
-        assert!(tx_context::sender(ctx) == course.teacher, E_NOT_TEACHER);
-        assert!(course.status == READY_FOR_EXAM, E_INVALID_STATUS);
-        assert!(vector::length(&answer_hash) == ANSWER_HASH_LENGTH, E_INVALID_ANSWER_HASH);
-        assert!(duration_ms > 0u64, E_INVALID_DURATION);
+        assert!(tx_context::sender(ctx) == course.teacher, ENotTeacher);
+        assert!(course.status == READY_FOR_EXAM, EInvalidStatus);
+        assert!(vector::length(&answer_hash) == ANSWER_HASH_LENGTH, EInvalidAnswerHash);
+        assert!(duration_ms > 0u64, EInvalidDuration);
 
         course.answer_hash = answer_hash;
         course.exam_duration_ms = duration_ms;
@@ -223,45 +301,17 @@ module teaching_platform::course {
         course.status == ENROLLING || course.status == READY_FOR_EXAM
     }
 
-    public fun status_enrolling(): u8 {
-        ENROLLING
-    }
+    public fun status_enrolling(): u8 { ENROLLING }
+    public fun status_ready_for_exam(): u8 { READY_FOR_EXAM }
+    public fun status_exam_active(): u8 { EXAM_ACTIVE }
+    public fun status_scored(): u8 { SCORED }
+    public fun status_rewards_distributed(): u8 { REWARDS_DISTRIBUTED }
 
-    public fun status_ready_for_exam(): u8 {
-        READY_FOR_EXAM
-    }
-
-    public fun status_exam_active(): u8 {
-        EXAM_ACTIVE
-    }
-
-    public fun status_scored(): u8 {
-        SCORED
-    }
-
-    public fun status_rewards_distributed(): u8 {
-        REWARDS_DISTRIBUTED
-    }
-
-    public fun get_course_status(course: &Course): u8 {
-        course.status
-    }
-
-    public fun get_enrolled_count(course: &Course): u64 {
-        course.enrolled_count
-    }
-
-    public fun get_exam_deadline(course: &Course): u64 {
-        course.exam_deadline
-    }
-
-    public fun get_tuition(course: &Course): u64 {
-        course.tuition
-    }
-
-    public fun get_teacher(course: &Course): address {
-        course.teacher
-    }
+    public fun get_course_status(course: &Course): u8 { course.status }
+    public fun get_enrolled_count(course: &Course): u64 { course.enrolled_count }
+    public fun get_exam_deadline(course: &Course): u64 { course.exam_deadline }
+    public fun get_tuition(course: &Course): u64 { course.tuition }
+    public fun get_teacher(course: &Course): address { course.teacher }
 
     public fun is_student_enrolled(course: &Course, student: address): bool {
         table::contains(&course.students, student)

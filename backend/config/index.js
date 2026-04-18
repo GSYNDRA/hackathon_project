@@ -6,15 +6,17 @@ module.exports = {
   
   database: {
     host: process.env.DB_HOST || 'localhost',
-    port: process.env.DB_PORT || 5433,  // Note: Using 5433 since 5432 is taken
+    port: process.env.DB_PORT || 5433,
     name: process.env.DB_NAME || 'sui_teaching',
     user: process.env.DB_USER || 'postgres',
     password: process.env.DB_PASSWORD || 'password',
   },
   
   sui: {
+    network: process.env.SUI_NETWORK || 'testnet',
     rpcUrl: process.env.SUI_RPC_URL || 'https://fullnode.testnet.sui.io:443',
     packageId: process.env.SUI_PACKAGE_ID || '',
+    platformObjectId: process.env.SUI_PLATFORM_OBJECT_ID || '',
   },
   
   jwt: {
