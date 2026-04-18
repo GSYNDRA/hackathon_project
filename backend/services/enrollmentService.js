@@ -1,4 +1,5 @@
 const models = require('../models');
+const { broadcastToCourse, broadcastToAll } = require('../utils/websocket');
 
 class EnrollmentService {
   async createEnrollment(data) {
@@ -7,9 +8,38 @@ class EnrollmentService {
         course_id: data.course_id,
         student_address: data.student_address,
         amount_paid: data.amount_paid,
-        on_chain_tx_digest: data.tx_digest
+        on_chain_tx_digest: data.tx_digest,
       });
-      
+
+      // Mirror the on-chain status flip: ENROLLING -> READY_FOR_EXAM once min_students reached
+      const course = await models.Course.findByPk(data.course_id);
+      let newStatus = course?.status;
+      if (course && course.status === 0) {
+        const enrolledCount = await models.Enrollment.count({
+          where: { course_id: data.course_id },
+        });
+        if (enrolledCount >= course.min_students) {
+          await course.update({ status: 1 });
+          newStatus = 1;
+        }
+      }
+
+      const currentEnrolled = await models.Enrollment.count({
+        where: { course_id: data.course_id },
+      });
+      broadcastToCourse(data.course_id, {
+        type: 'STUDENT_ENROLLED',
+        student_address: data.student_address,
+        enrolled_count: currentEnrolled,
+        status: newStatus,
+      });
+      broadcastToAll({
+        type: 'COURSE_UPDATED',
+        course_id: Number(data.course_id),
+        status: newStatus,
+        enrolled_count: currentEnrolled,
+      });
+
       return enrollment;
     } catch (error) {
       throw new Error(`Failed to create enrollment: ${error.message}`);

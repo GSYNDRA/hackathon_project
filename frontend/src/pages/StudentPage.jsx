@@ -1,40 +1,49 @@
-import React, { useState, useEffect, useCallback, useRef } from 'react';
-import { ConnectButton } from '@mysten/dapp-kit';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { useSignAndExecuteTransaction, useSuiClient } from '@mysten/dapp-kit';
 import { Transaction } from '@mysten/sui/transactions';
-import { useRole } from '../contexts/RoleContext';
-import { useWallet } from '../contexts/WalletContext';
-import WalletDisconnectButton from '../components/WalletDisconnectButton';
+import { keccak256 } from 'js-sha3';
 import {
-  getAllCourses,
-  getCourseById,
-  checkEnrollment,
-  getExamQuestions,
-  getExamStatus,
-  enrollInCourse,
-  submitAnswers,
-  checkSubmission,
-  getMyRank,
-  getResults,
+  BookOpen, Coins, Users, Timer, Trophy, CheckCircle2, X, AlertCircle, Play, Flag,
+} from 'lucide-react';
+import { useWallet } from '../contexts/WalletContext';
+import Card from '../components/Card';
+import Button from '../components/Button';
+import Badge from '../components/Badge';
+import wsService from '../services/websocket';
+import {
+  getAllCourses, checkEnrollment, enrollInCourse, getCourseById,
+  getExamQuestions, getExamStatus, submitAnswers, checkSubmission,
+  getMyRank, getResults,
 } from '../services/api';
-import { PACKAGE_ID, PLATFORM_OBJECT_ID, COURSE_STATUSES, STATUS_LABELS, SUI_TO_MIST, MIST_TO_SUI } from '../config/constants';
+import {
+  PACKAGE_ID, PLATFORM_OBJECT_ID, SUI_CLOCK_OBJECT_ID,
+  COURSE_STATUSES, STATUS_LABELS, STATUS_TONE, MIST_TO_SUI,
+} from '../config/constants';
 
 const STATUS = COURSE_STATUSES;
 
-function EnrollButton({ course, address, onEnrolled }) {
+async function execOrThrow(client, signAndExecute, tx, label) {
+  const res = await signAndExecute({ transaction: tx, options: { showEffects: true } });
+  const resp = await client.waitForTransaction({ digest: res.digest, options: { showEffects: true } });
+  if (resp.effects?.status?.status !== 'success') {
+    throw new Error(`On-chain ${label} failed: ${resp.effects?.status?.error || 'unknown'}`);
+  }
+  return { digest: res.digest, resp };
+}
+
+/* ---------- Enroll ---------- */
+function EnrollButton({ course, onEnrolled }) {
   const { mutateAsync: signAndExecute } = useSignAndExecuteTransaction();
   const client = useSuiClient();
+  const { address } = useWallet();
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
 
-  const handleEnroll = async () => {
+  const run = async () => {
     if (!address) return setError('Wallet not connected');
-    setLoading(true);
-    setError(null);
-
+    setLoading(true); setError(null);
     try {
       const tuitionMist = BigInt(course.tuition_amount);
-
       const tx = new Transaction();
       const [paymentCoin] = tx.splitCoins(tx.gas, [tx.pure.u64(tuitionMist.toString())]);
       tx.moveCall({
@@ -43,444 +52,432 @@ function EnrollButton({ course, address, onEnrolled }) {
           tx.object(PLATFORM_OBJECT_ID),
           tx.object(course.on_chain_id),
           paymentCoin,
+          tx.object(SUI_CLOCK_OBJECT_ID),
         ],
       });
-
-      const result = await signAndExecute({ transaction: tx });
-      await client.waitForTransaction({ digest: result.digest });
-
+      const { digest } = await execOrThrow(client, signAndExecute, tx, 'enroll_and_pay');
       await enrollInCourse(course.id, {
         student_address: address,
         amount_paid: course.tuition_amount,
-        tx_digest: result.digest,
+        tx_digest: digest,
       });
-
       onEnrolled?.();
-    } catch (err) {
-      setError(err.message || 'Enrollment failed');
+    } catch (e) {
+      setError(e.message || 'Enrollment failed');
     } finally {
       setLoading(false);
     }
   };
 
   return (
-    <div>
-      <button className="btn btn-primary btn-sm" onClick={handleEnroll} disabled={loading}>
-        {loading ? 'Enrolling...' : `Enroll & Pay ${MIST_TO_SUI(course.tuition_amount)} SUI`}
-      </button>
-      {error && <p className="error-text-sm">{error}</p>}
+    <div className="flex flex-col gap-1">
+      <Button size="sm" onClick={run} loading={loading}>
+        <Coins className="h-4 w-4" /> Enroll · {MIST_TO_SUI(course.tuition_amount)} SUI
+      </Button>
+      {error && <span className="text-xs text-red-300">{error}</span>}
     </div>
   );
 }
 
-function ExamView({ course, address, onComplete }) {
+/* ---------- Exam view ---------- */
+function ExamView({ course, onClose, onComplete }) {
   const { mutateAsync: signAndExecute } = useSignAndExecuteTransaction();
   const client = useSuiClient();
+  const { address } = useWallet();
   const [questions, setQuestions] = useState([]);
   const [answers, setAnswers] = useState({});
-  const [loading, setLoading] = useState(true);
+  const [deadline, setDeadline] = useState(null);
+  const [now, setNow] = useState(Date.now());
   const [submitting, setSubmitting] = useState(false);
-  const [timeLeft, setTimeLeft] = useState(null);
   const [submitted, setSubmitted] = useState(false);
   const [error, setError] = useState(null);
-  const timerRef = useRef(null);
   const answersRef = useRef({});
+  const autoRef = useRef(false);
 
   useEffect(() => { answersRef.current = answers; }, [answers]);
 
+  // Load questions + status
   useEffect(() => {
-    const loadQuestions = async () => {
+    (async () => {
       try {
-        const data = await getExamQuestions(course.id);
-        setQuestions(data);
-        const initial = {};
-        data.forEach((_, i) => { initial[i] = null; });
-        setAnswers(initial);
-      } catch (err) {
-        setError('Failed to load questions');
-      } finally {
-        setLoading(false);
+        const qs = await getExamQuestions(course.id);
+        setQuestions(qs);
+        const init = {}; qs.forEach((_, i) => { init[i] = null; });
+        setAnswers(init);
+
+        const st = await getExamStatus(course.id);
+        if (st.exam_deadline) setDeadline(new Date(st.exam_deadline).getTime());
+
+        const sub = await checkSubmission(course.id, address);
+        if (sub.hasSubmitted) setSubmitted(true);
+      } catch (e) {
+        setError(e.message);
       }
-    };
+    })();
+  }, [course.id, address]);
 
-    const loadTiming = async () => {
-      try {
-        const status = await getExamStatus(course.id);
-        if (status.exam_deadline) {
-          const deadline = parseInt(status.exam_deadline);
-          const remaining = Math.max(0, deadline - Date.now());
-          setTimeLeft(remaining);
-        }
-      } catch {
-        // fallback: no timing from backend
-      }
-    };
-
-    loadQuestions();
-    loadTiming();
-  }, [course.id]);
-
+  // Tick
   useEffect(() => {
-    if (timeLeft === null || timeLeft <= 0) return;
+    const id = setInterval(() => setNow(Date.now()), 500);
+    return () => clearInterval(id);
+  }, []);
 
-    timerRef.current = setInterval(() => {
-      setTimeLeft(prev => {
-        if (prev <= 1000) {
-          clearInterval(timerRef.current);
-          handleAutoSubmit();
-          return 0;
-        }
-        return prev - 1000;
-      });
-    }, 1000);
+  const buildAnswerArray = useCallback(() => {
+    return questions.map((_, i) => {
+      const a = answersRef.current[i];
+      return a !== null && a !== undefined ? a : 255;
+    });
+  }, [questions]);
 
-    return () => clearInterval(timerRef.current);
-  }, [timeLeft !== null && timeLeft > 0]);
-
-  const handleAutoSubmit = async () => {
-    if (timerRef.current) clearInterval(timerRef.current);
-
-    const currentAnswers = answersRef.current;
-    const answerArray = questions.map((_, i) => currentAnswers[i] !== null && currentAnswers[i] !== undefined ? currentAnswers[i] : 255);
-
-    try {
-      await submitAnswers(course.id, {
-        student_address: address,
-        answers: answerArray,
-        is_auto_submit: true,
-      });
-      setSubmitted(true);
-      onComplete?.();
-    } catch (err) {
-      console.error('Auto-submit failed:', err);
-    }
-  };
-
-  const handleSubmit = async () => {
+  const submit = useCallback(async (isAuto = false) => {
+    if (submitted || autoRef.current) return;
+    autoRef.current = true;
     setSubmitting(true);
     setError(null);
-
     try {
-      const answerArray = questions.map((_, i) => {
-        const a = answers[i];
-        return a !== null && a !== undefined ? a : 255;
+      const answerArray = buildAnswerArray();
+      const tx = new Transaction();
+      tx.moveCall({
+        target: `${PACKAGE_ID}::course::submit_answers`,
+        arguments: [
+          tx.object(course.on_chain_id),
+          tx.pure.vector('u8', answerArray),
+          tx.object(SUI_CLOCK_OBJECT_ID),
+        ],
       });
-
+      const { digest } = await execOrThrow(client, signAndExecute, tx, 'submit_answers');
       await submitAnswers(course.id, {
         student_address: address,
         answers: answerArray,
+        answers_hash: '0x' + keccak256(new Uint8Array(answerArray)),
         submitted_at: new Date().toISOString(),
+        is_auto_submit: isAuto,
+        tx_digest: digest,
       });
-
       setSubmitted(true);
-      if (timerRef.current) clearInterval(timerRef.current);
       onComplete?.();
-    } catch (err) {
-      setError(err.message || 'Submission failed');
+    } catch (e) {
+      setError(e.message || 'Submission failed');
+      autoRef.current = false;
     } finally {
       setSubmitting(false);
     }
-  };
+  }, [address, buildAnswerArray, client, course.id, course.on_chain_id, onComplete, signAndExecute, submitted]);
 
-  const formatTime = (ms) => {
-    if (ms <= 0) return '00:00';
-    const mins = Math.floor(ms / 60000);
-    const secs = Math.floor((ms % 60000) / 1000);
-    return `${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
-  };
+  // Auto-submit on deadline
+  useEffect(() => {
+    if (!deadline || submitted || autoRef.current) return;
+    if (now >= deadline) submit(true);
+  }, [now, deadline, submitted, submit]);
 
-  if (loading) return <p>Loading exam...</p>;
+  const timeLeft = deadline ? Math.max(0, deadline - now) : null;
+  const mm = timeLeft != null ? String(Math.floor(timeLeft / 60000)).padStart(2, '0') : '--';
+  const ss = timeLeft != null ? String(Math.floor((timeLeft % 60000) / 1000)).padStart(2, '0') : '--';
 
-  if (submitted) {
+  return (
+    <div className="fixed inset-0 z-50 bg-ink-900/80 backdrop-blur-sm overflow-y-auto">
+      <div className="max-w-3xl mx-auto p-6">
+        <div className="flex items-center justify-between mb-5">
+          <div>
+            <h2 className="text-xl font-bold">{course.name}</h2>
+            <p className="text-sm text-ink-200">Answer all questions before the timer ends.</p>
+          </div>
+          <div className="flex items-center gap-3">
+            <div className="flex items-center gap-2 glass rounded-xl px-3 py-2">
+              <Timer className="h-4 w-4 text-sui-300" />
+              <span className="font-mono text-lg tabular-nums">{mm}:{ss}</span>
+            </div>
+            <button onClick={onClose} className="h-10 w-10 grid place-items-center rounded-xl glass hover:bg-white/10">
+              <X className="h-4 w-4" />
+            </button>
+          </div>
+        </div>
+
+        {error && (
+          <Card className="mb-4 border-red-400/30 bg-red-400/10">
+            <div className="flex items-start gap-2 text-red-300 text-sm"><AlertCircle className="h-4 w-4 mt-0.5" /> {error}</div>
+          </Card>
+        )}
+
+        {submitted ? (
+          <Card className="text-center py-10">
+            <CheckCircle2 className="h-10 w-10 mx-auto text-emerald-400 mb-3" />
+            <h3 className="font-semibold mb-1">Submission received</h3>
+            <p className="text-sm text-ink-200">Wait for the teacher to reveal answers.</p>
+            <div className="mt-4"><Button onClick={onClose} variant="secondary">Back</Button></div>
+          </Card>
+        ) : (
+          <div className="space-y-3">
+            {questions.map((q, i) => (
+              <Card key={i}>
+                <div className="text-xs uppercase tracking-wider text-sui-300 mb-2">Question {i + 1}</div>
+                <div className="font-medium mb-3">{q.question_text}</div>
+                <div className="grid md:grid-cols-2 gap-2">
+                  {q.options.map((opt, oi) => {
+                    const active = answers[i] === oi;
+                    return (
+                      <button
+                        key={oi} type="button"
+                        onClick={() => setAnswers((a) => ({ ...a, [i]: oi }))}
+                        className={`flex items-center gap-2 p-3 rounded-xl border text-left transition-colors ${active ? 'border-sui-400/60 bg-sui-400/15' : 'border-white/10 hover:border-white/25'}`}
+                      >
+                        <span className={`h-6 w-6 grid place-items-center rounded-full text-xs font-semibold ${active ? 'bg-sui-400 text-ink-900' : 'bg-white/10 text-ink-100'}`}>
+                          {String.fromCharCode(65 + oi)}
+                        </span>
+                        <span className="text-sm">{opt}</span>
+                      </button>
+                    );
+                  })}
+                </div>
+              </Card>
+            ))}
+            <div className="flex justify-end sticky bottom-4">
+              <Button size="lg" onClick={() => submit(false)} loading={submitting}>
+                <Flag className="h-4 w-4" /> Submit answers
+              </Button>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/* ---------- Results panel ---------- */
+function MyResult({ course }) {
+  const { address } = useWallet();
+  const [rank, setRank] = useState(null);
+  const [status, setStatus] = useState('loading'); // 'loading' | 'ok' | 'not_ranked' | 'error'
+  const [err, setErr] = useState(null);
+  useEffect(() => {
+    let cancelled = false;
+    getMyRank(course.id, address)
+      .then((r) => { if (!cancelled) { setRank(r); setStatus('ok'); } })
+      .catch((e) => {
+        if (cancelled) return;
+        const msg = String(e.message || '');
+        if (msg.toLowerCase().includes('not found')) {
+          setStatus('not_ranked');
+        } else {
+          setErr(msg);
+          setStatus('error');
+        }
+      });
+    return () => { cancelled = true; };
+  }, [course.id, address]);
+
+  if (status === 'loading') return <p className="text-xs text-ink-200">Computing…</p>;
+  if (status === 'not_ranked') {
     return (
-      <div className="exam-submitted">
-        <h3>Answers Submitted!</h3>
-        <p>Wait for the teacher to score the exam.</p>
-        <button className="btn btn-secondary" onClick={onComplete}>Back to Dashboard</button>
+      <Badge tone="gray">
+        {course.status === STATUS.SCORED || course.status === STATUS.REWARDS_DISTRIBUTED
+          ? 'No submission'
+          : 'Not scored yet'}
+      </Badge>
+    );
+  }
+  if (status === 'error') return <p className="text-xs text-red-300">{err}</p>;
+
+  // Student was auto-submitted as no-show — they can't be rewarded on chain.
+  if (rank.auto_submitted) {
+    return (
+      <div className="flex items-center gap-2 text-sm">
+        <Badge tone="gray">No submission</Badge>
+        <span className="text-xs text-ink-200">Tuition forfeited</span>
       </div>
     );
   }
 
-  const answeredCount = Object.values(answers).filter(a => a !== null && a !== undefined).length;
-
+  const hasReward = Number(rank.reward_amount) > 0;
   return (
-    <div className="exam-view">
-      <div className="exam-header">
-        <h2>{course.name} - Exam</h2>
-        {timeLeft !== null && (
-          <div className={`timer ${timeLeft < 60000 ? 'timer-urgent' : ''}`}>
-            Time: {formatTime(timeLeft)}
-          </div>
-        )}
-        <p>{answeredCount}/{questions.length} answered</p>
-      </div>
-
-      {error && <p className="error-text">{error}</p>}
-
-      <div className="questions-list">
-        {questions.map((q, i) => (
-          <div key={i} className={`question-item ${answers[i] !== null && answers[i] !== undefined ? 'answered' : 'unanswered'}`}>
-            <h4>Q{i + 1}: {q.question_text}</h4>
-            <div className="options-list">
-              {Array.isArray(q.options) && q.options.map((opt, oi) => (
-                <label key={oi} className="option-label">
-                  <input type="radio" name={`q-${i}`}
-                    checked={answers[i] === oi}
-                    onChange={() => setAnswers(prev => ({ ...prev, [i]: oi }))}
-                  />
-                  <span>{String.fromCharCode(65 + oi)}. {opt}</span>
-                </label>
-              ))}
-            </div>
-          </div>
-        ))}
-      </div>
-
-      <button className="btn btn-primary" onClick={handleSubmit} disabled={submitting}>
-        {submitting ? 'Submitting...' : `Submit Answers (${answeredCount}/${questions.length})`}
-      </button>
+    <div className="flex items-center gap-3 text-sm flex-wrap">
+      <Badge tone={rank.rank_position === 1 ? 'amber' : 'blue'}>
+        <Trophy className="h-3 w-3" /> Rank {rank.rank_position}
+      </Badge>
+      <span className="text-ink-100">{rank.percentage}%</span>
+      {hasReward ? (
+        <Badge tone="green">+{MIST_TO_SUI(rank.reward_amount).toFixed(4)} SUI</Badge>
+      ) : course.status === STATUS.REWARDS_DISTRIBUTED ? (
+        <Badge tone="gray">Not in top 20%</Badge>
+      ) : null}
     </div>
   );
 }
 
-function ResultsView({ course }) {
-  const [results, setResults] = useState([]);
-  const [myRank, setMyRank] = useState(null);
-  const { address } = useWallet();
-
-  useEffect(() => {
-    const load = async () => {
-      try {
-        const data = await getResults(course.id);
-        setResults(data);
-      } catch (err) {
-        console.error('Failed to load results:', err);
-      }
-    };
-    load();
-  }, [course.id]);
-
-  useEffect(() => {
-    if (address) {
-      getMyRank(course.id, address).then(setMyRank).catch(() => {});
-    }
-  }, [course.id, address]);
-
+/* ---------- Course card ---------- */
+function CourseCard({ course, enrolled, onEnrolled, onOpenExam }) {
+  const status = course.status ?? 0;
   return (
-    <div className="results-view">
-      <h2>Results: {course.name}</h2>
-      {myRank && (
-        <div className="my-rank-card">
-          <h3>Your Result</h3>
-          <p>Rank: #{myRank.rank}</p>
-          <p>Score: {myRank.percentage}%</p>
-          {myRank.reward_amount > 0 && <p className="reward-text">Reward: {(myRank.reward_amount / 1e9).toFixed(4)} SUI</p>}
+    <Card className="flex flex-col gap-3" hoverable>
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          <h3 className="font-semibold truncate">{course.name}</h3>
+          {course.description && (
+            <p className="text-xs text-ink-200 mt-1 line-clamp-2">{course.description}</p>
+          )}
         </div>
-      )}
-      <div className="results-list">
-        {results.map((r, i) => (
-          <div key={i} className="result-card">
-            <span>#{r.rank}</span>
-            <span>{r.student_address?.slice(0, 8)}...{r.student_address?.slice(-4)}</span>
-            <span>Score: {r.percentage}%</span>
-          </div>
-        ))}
+        <Badge tone={STATUS_TONE[status]}>{STATUS_LABELS[status]}</Badge>
       </div>
-    </div>
+
+      <div className="flex items-center gap-4 text-xs text-ink-200">
+        <span className="flex items-center gap-1"><Users className="h-3.5 w-3.5" /> {course.enrolled_count || 0}/{course.max_students}</span>
+        <span className="flex items-center gap-1 text-sui-300"><Coins className="h-3.5 w-3.5" /> {MIST_TO_SUI(course.tuition_amount)} SUI</span>
+      </div>
+
+      <div className="flex items-center gap-2 mt-1">
+        {!enrolled && (status === STATUS.ENROLLING || status === STATUS.READY_FOR_EXAM) && (
+          <EnrollButton course={course} onEnrolled={onEnrolled} />
+        )}
+        {enrolled && status === STATUS.EXAM_ACTIVE && (
+          <Button size="sm" onClick={() => onOpenExam(course)}>
+            <Play className="h-4 w-4" /> Take exam
+          </Button>
+        )}
+        {enrolled && status === STATUS.SCORED && <MyResult course={course} />}
+        {enrolled && status === STATUS.REWARDS_DISTRIBUTED && <MyResult course={course} />}
+        {enrolled && (status === STATUS.ENROLLING || status === STATUS.READY_FOR_EXAM) && (
+          <Badge tone="teal"><CheckCircle2 className="h-3 w-3" /> Enrolled</Badge>
+        )}
+      </div>
+    </Card>
   );
 }
 
-const StudentPage = () => {
-  const { address, isConnected } = useWallet();
-  const { role, isStudent, hasRole } = useRole();
+/* ---------- Page ---------- */
+export default function StudentPage() {
+  const { address } = useWallet();
   const [courses, setCourses] = useState([]);
-  const [enrollmentStatus, setEnrollmentStatus] = useState({});
-  const [submissionStatus, setSubmissionStatus] = useState({});
+  const [enrolledMap, setEnrolledMap] = useState({}); // course.id -> bool
+  const [activeExam, setActiveExam] = useState(null);
   const [loading, setLoading] = useState(true);
-  const [activeView, setActiveView] = useState('dashboard');
-  const [selectedCourse, setSelectedCourse] = useState(null);
+  const [fetchError, setFetchError] = useState(null);
 
-  const loadData = useCallback(async () => {
-    if (!address) return;
+  const refresh = useCallback(async () => {
+    setLoading(true); setFetchError(null);
     try {
-      setLoading(true);
-      const data = await getAllCourses({});
-      setCourses(data);
-
-      const enrollChecks = {};
-      const subChecks = {};
-      for (const c of data) {
-        try {
-          const enrollRes = await checkEnrollment(c.id, address);
-          enrollChecks[c.id] = enrollRes.isEnrolled;
-        } catch { enrollChecks[c.id] = false; }
-
-        if (enrollChecks[c.id] && c.status >= STATUS.EXAM_ACTIVE) {
+      const all = await getAllCourses();
+      setCourses(all);
+      const map = {};
+      await Promise.all(
+        all.map(async (c) => {
           try {
-            const subRes = await checkSubmission(c.id, address);
-            subChecks[c.id] = subRes.hasSubmitted;
-          } catch { subChecks[c.id] = false; }
-        }
-      }
-      setEnrollmentStatus(enrollChecks);
-      setSubmissionStatus(subChecks);
-    } catch (err) {
-      console.error('Failed to load courses:', err);
+            const { isEnrolled } = await checkEnrollment(c.id, address);
+            map[c.id] = isEnrolled;
+          } catch {
+            map[c.id] = false;
+          }
+        })
+      );
+      setEnrolledMap(map);
+    } catch (e) {
+      setFetchError(e.message);
     } finally {
       setLoading(false);
     }
   }, [address]);
 
   useEffect(() => {
-    if (address) loadData();
-  }, [address, loadData]);
+    if (!address) return;
+    refresh();
+    // Safety-net poll (every 30 s). WS + focus refetch handle the live path.
+    const poll = setInterval(refresh, 30000);
+    const onFocus = () => refresh();
+    window.addEventListener('focus', onFocus);
+    // Any course-wide change triggers a refresh (new course, status change).
+    const unsubGlobal = wsService.subscribeGlobal((msg) => {
+      if (msg.type === 'COURSE_CREATED' || msg.type === 'COURSE_UPDATED') refresh();
+    });
+    return () => {
+      clearInterval(poll);
+      window.removeEventListener('focus', onFocus);
+      unsubGlobal?.();
+    };
+  }, [address, refresh]);
 
-  const handleCourseAction = (course, action) => {
-    setSelectedCourse(course);
-    setActiveView(action);
-  };
-
-  const refreshData = () => {
-    setActiveView('dashboard');
-    setSelectedCourse(null);
-    loadData();
-  };
-
-  if (!isConnected) {
-    return (
-      <div className="page">
-        <div className="page-header">
-          <h1>Student Dashboard</h1>
-          <p>Please connect your wallet.</p>
-          <ConnectButton connectText="Connect Wallet" />
-        </div>
-      </div>
+  // Subscribe to WS per-course events for courses relevant to the student.
+  useEffect(() => {
+    const unsubs = courses.map((c) =>
+      wsService.subscribe(c.id, (msg) => {
+        if (
+          msg.type === 'EXAM_STARTED' ||
+          msg.type === 'EXAM_SCORED' ||
+          msg.type === 'REWARDS_DISTRIBUTED' ||
+          msg.type === 'STUDENT_ENROLLED'
+        ) {
+          refresh();
+        }
+      })
     );
-  }
+    return () => unsubs.forEach((u) => u?.());
+  }, [courses.map((c) => c.id).join(','), refresh]);
 
-  if (hasRole && !isStudent) {
-    return (
-      <div className="page">
-        <div className="page-header">
-          <h1>Access Denied</h1>
-          <p>You are registered as a <strong>teacher</strong>. Go to the <a href="/teacher">Teacher Dashboard</a>.</p>
-        </div>
-      </div>
-    );
-  }
-
-  if (!hasRole) {
-    return (
-      <div className="page">
-        <div className="page-header">
-          <h1>Student Dashboard</h1>
-          <p>Please select your role first. <a href="/">Choose Role</a></p>
-        </div>
-      </div>
-    );
-  }
-
-  const myCourses = courses.filter(c => enrollmentStatus[c.id]);
-  const availableCourses = courses.filter(c => !enrollmentStatus[c.id] && c.status === STATUS.ENROLLING);
+  const myCourses = courses.filter((c) => enrolledMap[c.id]);
+  const availableCourses = courses.filter(
+    (c) => !enrolledMap[c.id] && (c.status === 0 || c.status === 1)
+  );
 
   return (
-    <div className="page">
-      <nav className="navbar">
-        <h1>Student Dashboard</h1>
-        <WalletDisconnectButton />
-      </nav>
+    <div>
+      <div className="mb-6">
+        <h1 className="text-2xl font-bold flex items-center gap-2">
+          <BookOpen className="h-6 w-6 text-sui-300" /> Student dashboard
+        </h1>
+        <p className="text-sm text-ink-200">Enroll in a course, compete, and win rewards.</p>
+      </div>
 
-      {activeView === 'dashboard' && (
-        <div className="dashboard">
-          {myCourses.length > 0 && (
-            <div className="section">
-              <h2>My Courses</h2>
-              <div className="courses-grid">
-                {myCourses.map(course => {
-                  const status = course.status ?? 0;
-                  const hasSubmitted = submissionStatus[course.id];
-                  return (
-                    <div key={course.id} className="course-card">
-                      <div className="course-header">
-                        <h3>{course.name}</h3>
-                        <span className={`badge badge-status-${status}`}>{STATUS_LABELS[status]}</span>
-                      </div>
-                      {course.description && <p className="course-description">{course.description}</p>}
-                      <div className="course-stats">
-                        <span>{course.enrolled_count || 0}/{course.max_students} students</span>
-                        <span className="course-price">{MIST_TO_SUI(course.tuition_amount)} SUI</span>
-                      </div>
-                      <div className="course-actions">
-                        {status === STATUS.EXAM_ACTIVE && !hasSubmitted && (
-                          <button className="btn btn-primary btn-sm"
-                            onClick={() => handleCourseAction(course, 'exam')}>
-                            Enter Exam
-                          </button>
-                        )}
-                        {status === STATUS.EXAM_ACTIVE && hasSubmitted && (
-                          <span className="badge badge-submitted">Answers Submitted - Waiting for Results</span>
-                        )}
-                        {status >= STATUS.SCORED && (
-                          <button className="btn btn-secondary btn-sm"
-                            onClick={() => handleCourseAction(course, 'results')}>
-                            View Results
-                          </button>
-                        )}
-                      </div>
-                    </div>
-                  );
-                })}
-              </div>
-            </div>
-          )}
-
-          <div className="section">
-            <h2>Available Courses</h2>
-            {loading ? (
-              <p>Loading...</p>
-            ) : availableCourses.length === 0 ? (
-              <div className="empty-state">
-                <p>No courses available for enrollment right now.</p>
-              </div>
-            ) : (
-              <div className="courses-grid">
-                {availableCourses.map(course => (
-                  <div key={course.id} className="course-card">
-                    <div className="course-header">
-                      <h3>{course.name}</h3>
-                      <span className={`badge badge-status-${course.status}`}>{STATUS_LABELS[course.status]}</span>
-                    </div>
-                    {course.description && <p className="course-description">{course.description}</p>}
-                    <div className="course-stats">
-                      <span>{course.enrolled_count || 0}/{course.max_students} students</span>
-                      <span className="course-price">{MIST_TO_SUI(course.tuition_amount)} SUI</span>
-                    </div>
-                    <div className="course-actions">
-                      <EnrollButton course={course} address={address} onEnrolled={refreshData} />
-                    </div>
-                  </div>
-                ))}
-              </div>
-            )}
+      {fetchError && (
+        <Card className="mb-4 border-red-400/30 bg-red-400/10">
+          <div className="flex items-center gap-2 text-red-300 text-sm">
+            <AlertCircle className="h-4 w-4" /> {fetchError}
           </div>
-        </div>
+        </Card>
       )}
 
-      {activeView === 'exam' && selectedCourse && (
-        <div className="dashboard">
-          <button className="btn btn-back" onClick={refreshData}>← Back to Dashboard</button>
-          <ExamView course={selectedCourse} address={address} onComplete={refreshData} />
-        </div>
-      )}
+      <section className="mb-8">
+        <h2 className="text-sm uppercase tracking-wider text-ink-200 mb-3">My courses</h2>
+        {loading ? (
+          <p className="text-ink-200">Loading…</p>
+        ) : myCourses.length === 0 ? (
+          <Card className="text-center py-8">
+            <p className="text-ink-200 text-sm">You haven't enrolled in any course yet.</p>
+          </Card>
+        ) : (
+          <div className="grid md:grid-cols-2 gap-4">
+            {myCourses.map((c) => (
+              <CourseCard
+                key={c.id}
+                course={c}
+                enrolled
+                onEnrolled={refresh}
+                onOpenExam={setActiveExam}
+              />
+            ))}
+          </div>
+        )}
+      </section>
 
-      {activeView === 'results' && selectedCourse && (
-        <div className="dashboard">
-          <button className="btn btn-back" onClick={refreshData}>← Back to Dashboard</button>
-          <ResultsView course={selectedCourse} />
-        </div>
+      <section>
+        <h2 className="text-sm uppercase tracking-wider text-ink-200 mb-3">Available courses</h2>
+        {loading ? null : availableCourses.length === 0 ? (
+          <Card className="text-center py-8">
+            <p className="text-ink-200 text-sm">No open courses right now — check back later.</p>
+          </Card>
+        ) : (
+          <div className="grid md:grid-cols-2 gap-4">
+            {availableCourses.map((c) => (
+              <CourseCard key={c.id} course={c} onEnrolled={refresh} onOpenExam={setActiveExam} />
+            ))}
+          </div>
+        )}
+      </section>
+
+      {activeExam && (
+        <ExamView
+          course={activeExam}
+          onClose={() => { setActiveExam(null); refresh(); }}
+          onComplete={refresh}
+        />
       )}
     </div>
   );
-};
-
-export default StudentPage;
+}

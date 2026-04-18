@@ -1,4 +1,5 @@
 const models = require('../models');
+const { broadcastToCourse, broadcastToAll } = require('../utils/websocket');
 
 class ResultService {
   async createResults(courseId, results) {
@@ -25,32 +26,65 @@ class ResultService {
     }
   }
 
-  async updateRewards(courseId, rewards) {
+  async updateRewards(courseId) {
     try {
-      await Promise.all(
-        rewards.map(r => 
-          models.Result.update(
-            {
-              reward_amount: r.reward_amount,
-              rewarded_at: r.rewarded_at
-            },
-            {
-              where: {
-                course_id: courseId,
-                student_address: r.student_address
-              }
-            }
-          )
-        )
+      const course = await models.Course.findByPk(courseId);
+      if (!course) throw new Error('Course not found');
+
+      // Pull DB rank rows in rank order.
+      const allResults = await models.Result.findAll({
+        where: { course_id: courseId },
+        order: [['rank_position', 'ASC']],
+      });
+
+      // Chain's distribute_rewards only ranks students who called submit_answers on chain.
+      // Auto-submitted no-shows get nothing on chain, so they must get nothing in the DB
+      // mirror too — otherwise the UI promises a reward that was never paid.
+      const submissions = await models.Submission.findAll({
+        where: { course_id: courseId },
+      });
+      const onChainAddresses = new Set(
+        submissions.filter((s) => !s.is_auto_submit).map((s) => s.student_address)
+      );
+      const onChainResults = allResults.filter((r) =>
+        onChainAddresses.has(r.student_address)
       );
 
-      // Update course status to REWARDS_DISTRIBUTED (5)
-      await models.Course.update(
-        { status: 5 },
-        { where: { id: courseId } }
-      );
+      const n = onChainResults.length;
+      let winnerCount = Math.floor((n * 20) / 100);
+      if (winnerCount === 0 && n > 0) winnerCount = 1;
 
-      return { success: true };
+      const tuition = BigInt(course.tuition_amount);
+      const now = new Date();
+
+      // Zero out every row first (idempotent & fixes past phantom rewards).
+      for (const r of allResults) {
+        await r.update({ reward_amount: 0, rewarded_at: null });
+      }
+
+      // Assign rewards to on-chain submitters in their rank order.
+      for (let i = 0; i < n; i++) {
+        const r = onChainResults[i];
+        let reward = 0n;
+        if (i < winnerCount) {
+          reward = tuition / (1n << BigInt(i));
+        }
+        await r.update({
+          reward_amount: reward.toString(),
+          rewarded_at: i < winnerCount ? now : null,
+        });
+      }
+
+      await course.update({ status: 4 });
+
+      broadcastToCourse(courseId, {
+        type: 'REWARDS_DISTRIBUTED',
+        winner_count: winnerCount,
+        on_chain_submitters: n,
+      });
+      broadcastToAll({ type: 'COURSE_UPDATED', course_id: Number(courseId), status: 4 });
+
+      return { success: true, winner_count: winnerCount, on_chain_submitters: n };
     } catch (error) {
       throw new Error(`Failed to update rewards: ${error.message}`);
     }
@@ -70,7 +104,17 @@ class ResultService {
         order: [['rank_position', 'ASC']]
       });
 
-      return results;
+      const submissions = await models.Submission.findAll({
+        where: { course_id: courseId },
+        attributes: ['student_address', 'is_auto_submit'],
+      });
+      const autoMap = new Map(submissions.map((s) => [s.student_address, s.is_auto_submit]));
+
+      return results.map((r) => {
+        const obj = r.toJSON();
+        obj.auto_submitted = autoMap.get(obj.student_address) ?? null;
+        return obj;
+      });
     } catch (error) {
       throw new Error(`Failed to get results: ${error.message}`);
     }
@@ -100,12 +144,21 @@ class ResultService {
       const result = await models.Result.findOne({
         where: {
           course_id: courseId,
-          student_address: studentAddress
+          student_address: studentAddress,
         },
-        attributes: ['rank_position', 'score', 'percentage', 'reward_amount']
+        attributes: ['rank_position', 'score', 'percentage', 'reward_amount'],
+      });
+      if (!result) return null;
+
+      const submission = await models.Submission.findOne({
+        where: { course_id: courseId, student_address: studentAddress },
+        attributes: ['is_auto_submit'],
       });
 
-      return result;
+      return {
+        ...result.toJSON(),
+        auto_submitted: submission?.is_auto_submit ?? null,
+      };
     } catch (error) {
       throw new Error(`Failed to get student rank: ${error.message}`);
     }

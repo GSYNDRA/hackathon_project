@@ -9,6 +9,8 @@ module teaching_platform::course {
     use sui::transfer;
     use sui::tx_context;
     use sui::vec_set::{Self as vec_set};
+    use sui::hash;
+    use sui::clock::{Self as clock, Clock};
     use std::string::{Self as string};
 
     const ENROLLING: u8 = 0;
@@ -44,6 +46,8 @@ module teaching_platform::course {
     const ENotRegistered: u64 = 20;
     const EWrongRoleTeacher: u64 = 21;
     const EWrongRoleStudent: u64 = 22;
+    const ENoSubmissions: u64 = 23;
+    const EEmptyAnswerKey: u64 = 24;
 
     public struct Platform has key {
         id: object::UID,
@@ -78,7 +82,7 @@ module teaching_platform::course {
     }
 
     public struct Submission has store {
-        answers_hash: vector<u8>,
+        answers: vector<u8>,
         submitted_at: u64,
         start_time: u64,
     }
@@ -132,6 +136,22 @@ module teaching_platform::course {
         course_id: address,
         deadline: u64,
         duration_ms: u64,
+    }
+
+    public struct AnswersSubmitted has copy, drop {
+        course_id: address,
+        student: address,
+    }
+
+    public struct ExamScored has copy, drop {
+        course_id: address,
+        total_submissions: u64,
+    }
+
+    public struct RewardsDistributed has copy, drop {
+        course_id: address,
+        winner_count: u64,
+        total_pool: u64,
     }
 
     public fun create_platform(ctx: &mut tx_context::TxContext) {
@@ -240,6 +260,7 @@ module teaching_platform::course {
         platform: &Platform,
         course: &mut Course,
         payment: coin::Coin<SUI>,
+        clock_obj: &Clock,
         ctx: &mut tx_context::TxContext,
     ) {
         assert!(is_student(platform, tx_context::sender(ctx)), EWrongRoleStudent);
@@ -254,7 +275,7 @@ module teaching_platform::course {
         balance::join(&mut course.escrow, coin::into_balance(payment));
 
         let student_info = StudentInfo {
-            enrolled_at: tx_context::epoch_timestamp_ms(ctx),
+            enrolled_at: clock::timestamp_ms(clock_obj),
             amount_paid: payment_amount,
         };
         table::add(&mut course.students, student, student_info);
@@ -278,6 +299,7 @@ module teaching_platform::course {
         course: &mut Course,
         answer_hash: vector<u8>,
         duration_ms: u64,
+        clock_obj: &Clock,
         ctx: &tx_context::TxContext,
     ) {
         assert!(tx_context::sender(ctx) == course.teacher, ENotTeacher);
@@ -287,7 +309,7 @@ module teaching_platform::course {
 
         course.answer_hash = answer_hash;
         course.exam_duration_ms = duration_ms;
-        course.exam_deadline = tx_context::epoch_timestamp_ms(ctx) + duration_ms;
+        course.exam_deadline = clock::timestamp_ms(clock_obj) + duration_ms;
         course.status = EXAM_ACTIVE;
 
         event::emit(ExamCreated {
@@ -344,5 +366,198 @@ module teaching_platform::course {
         };
 
         views
+    }
+
+    public fun result_view_student(rv: &ResultView): address { rv.student }
+    public fun result_view_score(rv: &ResultView): u64 { rv.score }
+    public fun result_view_percentage(rv: &ResultView): u8 { rv.percentage }
+    public fun result_view_time_taken_ms(rv: &ResultView): u64 { rv.time_taken_ms }
+    public fun result_view_rank(rv: &ResultView): u8 { rv.rank }
+    public fun result_view_reward_amount(rv: &ResultView): u64 { rv.reward_amount }
+
+    public fun submit_answers(
+        course: &mut Course,
+        answers: vector<u8>,
+        clock_obj: &Clock,
+        ctx: &mut tx_context::TxContext,
+    ) {
+        let student = tx_context::sender(ctx);
+        let now = clock::timestamp_ms(clock_obj);
+        assert!(course.status == EXAM_ACTIVE, EExamNotActive);
+        assert!(now <= course.exam_deadline, ETimeExpired);
+        assert!(table::contains(&course.students, student), ENotEnrolled);
+        assert!(!table::contains(&course.submissions, student), EAlreadySubmitted);
+        assert!(vector::length(&answers) > 0, ENoSubmissions);
+
+        let start_time = course.exam_deadline - course.exam_duration_ms;
+        let submission = Submission {
+            answers,
+            submitted_at: now,
+            start_time,
+        };
+        table::add(&mut course.submissions, student, submission);
+        vector::push_back(&mut course.submission_order, student);
+
+        event::emit(AnswersSubmitted {
+            course_id: object::uid_to_address(&course.id),
+            student,
+        });
+    }
+
+    public fun reveal_and_score(
+        course: &mut Course,
+        answer_key: vector<u8>,
+        ctx: &mut tx_context::TxContext,
+    ) {
+        assert!(tx_context::sender(ctx) == course.teacher, ENotTeacher);
+        assert!(course.status == EXAM_ACTIVE, EInvalidStatus);
+        assert!(vector::length(&answer_key) > 0, EEmptyAnswerKey);
+
+        let computed_hash = hash::keccak256(&answer_key);
+        assert!(computed_hash == course.answer_hash, EAnswerHashMismatch);
+
+        course.status = SCORED;
+
+        let total_questions = vector::length(&answer_key);
+        let n = vector::length(&course.submission_order);
+        let mut i = 0;
+
+        while (i < n) {
+            let student = *vector::borrow(&course.submission_order, i);
+            let submission = table::borrow(&course.submissions, student);
+            let student_answers = &submission.answers;
+            let answer_len = vector::length(student_answers);
+
+            let mut score = 0;
+            let mut j = 0;
+            while (j < total_questions) {
+                if (j < answer_len && *vector::borrow(student_answers, j) == *vector::borrow(&answer_key, j)) {
+                    score = score + 1;
+                };
+                j = j + 1;
+            };
+
+            let percentage = if (total_questions > 0) {
+                ((score * 100) / (total_questions as u64)) as u8
+            } else {
+                0u8
+            };
+            let mut time_taken_ms = submission.submitted_at;
+            if (submission.submitted_at > submission.start_time) {
+                time_taken_ms = submission.submitted_at - submission.start_time;
+            } else {
+                time_taken_ms = 0;
+            };
+
+            let result = Result {
+                score,
+                percentage,
+                time_taken_ms,
+                rank: 0,
+                reward_amount: 0,
+            };
+            table::add(&mut course.results, student, result);
+            vector::push_back(&mut course.result_order, student);
+
+            i = i + 1;
+        };
+
+        // Sort result_order: score descending, then time_taken ascending (bubble sort)
+        i = 0;
+        while (i < n) {
+            let mut j = 0;
+            while (j < n - 1 - i) {
+                let student_a = *vector::borrow(&course.result_order, j);
+                let student_b = *vector::borrow(&course.result_order, j + 1);
+                let result_a = table::borrow(&course.results, student_a);
+                let result_b = table::borrow(&course.results, student_b);
+
+                let should_swap = result_a.score < result_b.score
+                    || (result_a.score == result_b.score && result_a.time_taken_ms > result_b.time_taken_ms);
+
+                if (should_swap) {
+                    vector::swap(&mut course.result_order, j, j + 1);
+                };
+                j = j + 1;
+            };
+            i = i + 1;
+        };
+
+        // Assign ranks
+        i = 0;
+        while (i < n) {
+            let student = *vector::borrow(&course.result_order, i);
+            let result = table::borrow_mut(&mut course.results, student);
+            result.rank = (i + 1) as u8;
+            i = i + 1;
+        };
+
+        event::emit(ExamScored {
+            course_id: object::uid_to_address(&course.id),
+            total_submissions: n,
+        });
+    }
+
+    public fun distribute_rewards(
+        course: &mut Course,
+        ctx: &mut tx_context::TxContext,
+    ) {
+        assert!(tx_context::sender(ctx) == course.teacher, ENotTeacher);
+        assert!(course.status == SCORED, ENotScored);
+
+        course.status = REWARDS_DISTRIBUTED;
+
+        let total_pool = balance::value(&course.escrow);
+        let n = vector::length(&course.result_order);
+
+        // Winner count: max(1, floor(n * 20 / 100))
+        let mut winner_count = n * 20 / 100;
+        if (winner_count == 0) { winner_count = 1; };
+
+        // Reward model: rank i gets FLOOR(tuition / 2^i) as percentage of their own tuition
+        // Rank 0 (1st): 100% of tuition
+        // Rank 1 (2nd): 50% of tuition
+        // Rank 2 (3rd): 25% of tuition
+        // Last winner gets their calculated share; teacher gets everything else
+        let mut i = 0;
+        while (i < winner_count && i < n) {
+            let student = *vector::borrow(&course.result_order, i);
+            let result = table::borrow_mut(&mut course.results, student);
+            let student_info = table::borrow(&course.students, student);
+            let tuition = student_info.amount_paid;
+
+            // reward = tuition / 2^i (FLOOR)
+            let mut divisor = 1u64;
+            let mut p = i;
+            while (p > 0) {
+                divisor = divisor * 2;
+                p = p - 1;
+            };
+            let reward = tuition / divisor;
+
+            result.reward_amount = reward;
+
+            if (reward > 0) {
+                let student_balance = balance::split(&mut course.escrow, reward);
+                let student_coin = coin::from_balance(student_balance, ctx);
+                transfer::public_transfer(student_coin, student);
+            };
+
+            i = i + 1;
+        };
+
+        // Transfer remaining to teacher
+        let teacher_amount = balance::value(&course.escrow);
+        if (teacher_amount > 0) {
+            let teacher_balance = balance::split(&mut course.escrow, teacher_amount);
+            let teacher_coin = coin::from_balance(teacher_balance, ctx);
+            transfer::public_transfer(teacher_coin, course.teacher);
+        };
+
+        event::emit(RewardsDistributed {
+            course_id: object::uid_to_address(&course.id),
+            winner_count,
+            total_pool,
+        });
     }
 }

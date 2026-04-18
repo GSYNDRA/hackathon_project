@@ -75,18 +75,22 @@ const startServer = async () => {
       console.log('✅ Database models synchronized');
     }
     
+    server.on('error', (err) => {
+      if (err.code === 'EADDRINUSE') {
+        console.error(`\n❌ Port ${config.port} is already in use.`);
+        console.error(`   Another backend is probably still running. Kill it with:`);
+        console.error(`   lsof -i :${config.port} -t | xargs kill\n`);
+        process.exit(1);
+      }
+      console.error('❌ Server error:', err);
+      process.exit(1);
+    });
+
     server.listen(config.port, () => {
-      console.log(`\n🚀 Server running on port ${config.port}`);
-      console.log(`🌐 Environment: ${config.nodeEnv}`);
-      console.log(`📡 WebSocket server ready`);
-      console.log(`\n📚 API Documentation:`);
-      console.log(`   Health Check: GET http://localhost:${config.port}/health`);
-      console.log(`   API Routes:   http://localhost:${config.port}/api`);
-      console.log(`\n💡 Make sure your Docker PostgreSQL is running on port 5433`);
-      console.log(`   docker-compose up -d\n`);
+      console.log(`🚀 Server on :${config.port} · env=${config.nodeEnv} · WS ready`);
     });
   } catch (error) {
-    console.error('❌ Failed to start server:', error);
+    console.error('❌ Failed to start server:', error.message);
     process.exit(1);
   }
 };

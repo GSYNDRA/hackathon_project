@@ -1,38 +1,34 @@
-import React, { createContext, useContext, useCallback } from 'react';
-import { useCurrentAccount, useWallets, useDisconnectWallet } from '@mysten/dapp-kit';
+import React, { createContext, useContext, useEffect, useMemo } from 'react';
+import { useCurrentAccount, useCurrentWallet, useDisconnectWallet } from '@mysten/dapp-kit';
 
-const WalletContext = createContext(null);
+const WalletCtx = createContext({ address: null, connected: false, disconnect: () => {} });
 
-export const AppWalletProvider = ({ children }) => {
-  const currentAccount = useCurrentAccount();
-  const wallets = useWallets();
-  const { mutate: disconnectWallet } = useDisconnectWallet();
+export function WalletContextProvider({ children }) {
+  const account = useCurrentAccount();
+  const { currentWallet } = useCurrentWallet();
+  const { mutate: disconnect } = useDisconnectWallet();
 
-  const disconnect = useCallback(() => {
-    disconnectWallet();
-    localStorage.removeItem('user_role');
-    localStorage.removeItem('wallet_address');
-  }, [disconnectWallet]);
+  // Keep localStorage.wallet_address in sync with the connected account,
+  // so the axios interceptor can always attach the x-wallet-address header.
+  useEffect(() => {
+    if (account?.address) {
+      localStorage.setItem('wallet_address', account.address);
+    } else {
+      localStorage.removeItem('wallet_address');
+    }
+  }, [account?.address]);
 
-  const value = {
-    account: currentAccount,
-    address: currentAccount?.address,
-    isConnected: !!currentAccount,
-    wallets,
-    disconnect,
-  };
-
-  return (
-    <WalletContext.Provider value={value}>
-      {children}
-    </WalletContext.Provider>
+  const value = useMemo(
+    () => ({
+      address: account?.address || null,
+      connected: !!currentWallet,
+      walletName: currentWallet?.name || null,
+      disconnect: () => disconnect(),
+    }),
+    [account, currentWallet, disconnect]
   );
-};
 
-export const useWallet = () => {
-  const context = useContext(WalletContext);
-  if (!context) {
-    throw new Error('useWallet must be used within AppWalletProvider');
-  }
-  return context;
-};
+  return <WalletCtx.Provider value={value}>{children}</WalletCtx.Provider>;
+}
+
+export const useWallet = () => useContext(WalletCtx);

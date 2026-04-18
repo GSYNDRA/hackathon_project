@@ -25,13 +25,13 @@ class ResultController {
   async updateRewards(req, res) {
     try {
       const { course_id } = req.params;
-      const { rewards } = req.body;
-      
-      await resultService.updateRewards(course_id, rewards);
-      
+
+      const result = await resultService.updateRewards(course_id);
+
       res.json({
         success: true,
-        message: 'Rewards updated successfully'
+        message: 'Rewards updated successfully',
+        winner_count: result.winner_count,
       });
     } catch (error) {
       console.error('Update rewards error:', error);
@@ -51,7 +51,7 @@ class ResultController {
         return res.status(404).json({ error: 'Course not found' });
       }
       
-      if (course.status < 4) { // SCORED = 4
+      if (course.status < 3) { // SCORED = 3
         return res.status(403).json({ error: 'Results not available yet' });
       }
       

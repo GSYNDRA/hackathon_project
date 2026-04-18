@@ -1,147 +1,123 @@
-import React, { createContext, useContext, useState, useCallback, useEffect } from 'react';
-import { useWallet } from './WalletContext';
-import { registerUser, getUserRole, getOnChainRole } from '../services/api';
-import { useSignAndExecuteTransaction, useSuiClient } from '@mysten/dapp-kit';
+import React, { createContext, useCallback, useContext, useEffect, useState } from 'react';
 import { Transaction } from '@mysten/sui/transactions';
+import { useSignAndExecuteTransaction, useSuiClient } from '@mysten/dapp-kit';
 import { PACKAGE_ID, PLATFORM_OBJECT_ID, SUI_MODULE } from '../config/constants';
+import { useWallet } from './WalletContext';
+import { getUserRole, registerUser, getOnChainRole } from '../services/api';
 
-const RoleContext = createContext(null);
+const RoleCtx = createContext({
+  role: null,
+  isLoading: false,
+  error: null,
+  registerRole: async () => false,
+  clearRole: () => {},
+});
 
-export const RoleProvider = ({ children }) => {
-  const { address, isConnected } = useWallet();
+export function RoleContextProvider({ children }) {
+  const { address } = useWallet();
   const client = useSuiClient();
   const { mutateAsync: signAndExecuteTransaction } = useSignAndExecuteTransaction();
-  const [role, setRole] = useState(() => localStorage.getItem('user_role') || null);
+  const [role, setRole] = useState(null);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState(null);
-  const [txDigest, setTxDigest] = useState(null);
 
+  // Fetch role whenever the wallet address changes
   useEffect(() => {
-    if (!address) {
-      setRole(null);
-      localStorage.removeItem('user_role');
-      localStorage.removeItem('wallet_address');
-    }
-  }, [address]);
-
-  const checkExistingRole = useCallback(async () => {
-    if (!address) return null;
-    try {
-      const dbRole = await getUserRole(address);
-      if (dbRole?.role) {
-        setRole(dbRole.role);
-        localStorage.setItem('user_role', dbRole.role);
-        localStorage.setItem('wallet_address', address);
-        return dbRole.role;
+    const fetchRole = async () => {
+      if (!address) {
+        setRole(null);
+        return;
       }
-      const chainResult = await getOnChainRole(address);
-      if (chainResult?.role) {
-        setRole(chainResult.role);
-        localStorage.setItem('user_role', chainResult.role);
-        localStorage.setItem('wallet_address', address);
-        return chainResult.role;
-      }
-    } catch {
       try {
-        const chainResult = await getOnChainRole(address);
-        if (chainResult?.role) {
-          setRole(chainResult.role);
-          localStorage.setItem('user_role', chainResult.role);
-          localStorage.setItem('wallet_address', address);
-          return chainResult.role;
-        }
+        const data = await getUserRole(address);
+        setRole(data?.role || null);
       } catch {
-        // not registered either
+        setRole(null);
       }
-    }
-    return null;
+    };
+    fetchRole();
   }, [address]);
 
-  useEffect(() => {
-    if (isConnected && address) {
-      checkExistingRole();
-    }
-  }, [isConnected, address]);
-
-  const selectRole = useCallback(async (chosenRole) => {
-    if (!address) {
-      setError('Wallet not connected');
-      return false;
-    }
-
-    if (PLATFORM_OBJECT_ID === 'SET_AFTER_CALLING_CREATE_PLATFORM' || !PLATFORM_OBJECT_ID) {
-      setError('Platform not configured. Please deploy and create platform first.');
-      return false;
-    }
-
-    setIsLoading(true);
-    setError(null);
-
-    try {
-      const tx = new Transaction();
-      if (chosenRole === 'teacher') {
-        tx.moveCall({
-          target: `${PACKAGE_ID}::${SUI_MODULE}::register_as_teacher`,
-          arguments: [tx.object(PLATFORM_OBJECT_ID)],
-        });
-      } else {
-        tx.moveCall({
-          target: `${PACKAGE_ID}::${SUI_MODULE}::register_as_student`,
-          arguments: [tx.object(PLATFORM_OBJECT_ID)],
-        });
+  const registerRole = useCallback(
+    async (chosenRole) => {
+      if (!address) {
+        setError('Wallet not connected');
+        return false;
+      }
+      if (!PACKAGE_ID || !PLATFORM_OBJECT_ID) {
+        setError('Platform not configured — set VITE_SUI_PACKAGE_ID and VITE_SUI_PLATFORM_OBJECT_ID');
+        return false;
       }
 
-      const result = await signAndExecuteTransaction({ transaction: tx });
-      const digest = result.digest;
-      setTxDigest(digest);
+      setIsLoading(true);
+      setError(null);
 
-      await client.waitForTransaction({ digest });
+      try {
+        // Check on-chain role first — if this wallet is already in the other vec_set,
+        // the on-chain call would abort. We fail fast with a clear message.
+        try {
+          const onChain = await getOnChainRole(address);
+          if (onChain?.role && onChain.role !== chosenRole) {
+            throw new Error(
+              `This wallet is already registered on chain as "${onChain.role}". Use a different wallet.`
+            );
+          }
+          if (onChain?.role === chosenRole) {
+            // Already registered — just sync the DB and proceed
+            await registerUser(address, chosenRole, null);
+            setRole(chosenRole);
+            return true;
+          }
+        } catch (e) {
+          // Non-fatal: on-chain role check is best-effort
+          if (String(e.message || '').includes('already registered')) throw e;
+        }
 
-      await registerUser(address, chosenRole, digest);
+        const tx = new Transaction();
+        tx.moveCall({
+          target: `${PACKAGE_ID}::${SUI_MODULE}::register_as_${chosenRole}`,
+          arguments: [tx.object(PLATFORM_OBJECT_ID)],
+        });
 
-      setRole(chosenRole);
-      localStorage.setItem('user_role', chosenRole);
-      localStorage.setItem('wallet_address', address);
-      return true;
-    } catch (err) {
-      setError(err.message || 'Failed to register role');
-      return false;
-    } finally {
-      setIsLoading(false);
-    }
-  }, [address, signAndExecuteTransaction, client]);
+        const result = await signAndExecuteTransaction({
+          transaction: tx,
+          options: { showEffects: true },
+        });
+
+        const txResp = await client.waitForTransaction({
+          digest: result.digest,
+          options: { showEffects: true },
+        });
+
+        if (txResp.effects?.status?.status !== 'success') {
+          throw new Error(
+            `On-chain registration failed: ${txResp.effects?.status?.error || 'unknown'}`
+          );
+        }
+
+        await registerUser(address, chosenRole, result.digest);
+        setRole(chosenRole);
+        return true;
+      } catch (err) {
+        setError(err.message || 'Failed to register role');
+        return false;
+      } finally {
+        setIsLoading(false);
+      }
+    },
+    [address, client, signAndExecuteTransaction]
+  );
 
   const clearRole = useCallback(() => {
     setRole(null);
-    setTxDigest(null);
     setError(null);
-    localStorage.removeItem('user_role');
-    localStorage.removeItem('wallet_address');
   }, []);
 
-  const value = {
-    role,
-    isLoading,
-    error,
-    txDigest,
-    checkExistingRole,
-    selectTeacherRole: () => selectRole('teacher'),
-    selectStudentRole: () => selectRole('student'),
-    clearRole,
-    isTeacher: role === 'teacher',
-    isStudent: role === 'student',
-    hasRole: !!role,
-  };
-
   return (
-    <RoleContext.Provider value={value}>
+    <RoleCtx.Provider value={{ role, isLoading, error, registerRole, clearRole }}>
       {children}
-    </RoleContext.Provider>
+    </RoleCtx.Provider>
   );
-};
+}
 
-export const useRole = () => {
-  const context = useContext(RoleContext);
-  if (!context) throw new Error('useRole must be used within RoleProvider');
-  return context;
-};
+export const useRole = () => useContext(RoleCtx);

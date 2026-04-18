@@ -172,9 +172,9 @@ class CourseService {
       }
 
       await course.update({
-        status: 3, // EXAM_ACTIVE
+        status: 2, // EXAM_ACTIVE
         exam_start_time: startTime,
-        exam_deadline: deadline
+        exam_deadline: deadline,
       });
 
       return course;

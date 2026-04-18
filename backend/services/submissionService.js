@@ -1,4 +1,5 @@
 const models = require('../models');
+const { broadcastToCourse } = require('../utils/websocket');
 
 class SubmissionService {
   async createSubmission(data) {
@@ -11,9 +12,19 @@ class SubmissionService {
         submitted_at: data.submitted_at,
         time_taken_seconds: data.time_taken_seconds,
         is_auto_submit: data.is_auto_submit || false,
-        on_chain_tx_digest: data.tx_digest
+        on_chain_tx_digest: data.tx_digest,
       });
-      
+
+      const submittedCount = await models.Submission.count({
+        where: { course_id: data.course_id },
+      });
+      broadcastToCourse(data.course_id, {
+        type: 'EXAM_SUBMITTED',
+        student_address: data.student_address,
+        submitted_count: submittedCount,
+        is_auto_submit: !!data.is_auto_submit,
+      });
+
       return submission;
     } catch (error) {
       throw new Error(`Failed to create submission: ${error.message}`);

@@ -1,6 +1,11 @@
-const crypto = require('crypto');
+const { keccak_256 } = require('js-sha3');
+const models = require('../models');
 const courseService = require('../services/courseService');
-const { broadcastToCourse } = require('../utils/websocket');
+const { broadcastToCourse, broadcastToAll } = require('../utils/websocket');
+
+function keccak256Buffer(bytes) {
+  return Buffer.from(keccak_256.arrayBuffer(bytes));
+}
 
 class CourseController {
   async create(req, res) {
@@ -32,7 +37,9 @@ class CourseController {
         max_students,
         min_students
       });
-      
+
+      broadcastToAll({ type: 'COURSE_CREATED', course_id: course.id });
+
       res.json({
         success: true,
         course
@@ -84,12 +91,12 @@ class CourseController {
       );
       
       // Broadcast to WebSocket subscribers if exam is starting
-      if (status === 3 && exam_start_time && exam_deadline) {
+      if (status === 2 && exam_start_time && exam_deadline) {
         broadcastToCourse(id, {
           type: 'EXAM_STARTED',
           courseId: id,
           exam_start_time,
-          exam_deadline
+          exam_deadline,
         });
       }
       
@@ -114,8 +121,8 @@ class CourseController {
       
       const answerKey = questions.map(q => q.correct_answer_idx);
       const answerKeyBuffer = Buffer.from(answerKey);
-      const answerHash = crypto.createHash('sha256').update(answerKeyBuffer).digest();
-      
+      const answerHash = keccak256Buffer(answerKeyBuffer);
+
       const createdQuestions = await courseService.createExamQuestions(id, questions);
       
       res.json({
@@ -171,13 +178,13 @@ class CourseController {
     try {
       const { id } = req.params;
       const { exam_start_time, exam_deadline } = req.body;
-      
+
       const course = await courseService.startExam(
         id,
         exam_start_time,
         exam_deadline
       );
-      
+
       // Broadcast to all connected students
       broadcastToCourse(id, {
         type: 'EXAM_STARTED',
@@ -185,13 +192,179 @@ class CourseController {
         exam_start_time,
         exam_deadline
       });
-      
+
       res.json({
         success: true,
         course
       });
     } catch (error) {
       console.error('Start exam error:', error);
+      res.status(500).json({ error: error.message });
+    }
+  }
+
+  /**
+   * Prepare phase: return the answer key + counts without mutating anything.
+   * The teacher frontend calls this first, then runs on-chain reveal_and_score,
+   * and only after chain success calls scoreExamCommit below.
+   */
+  async scoreExamPrepare(req, res) {
+    try {
+      const { id } = req.params;
+      const course = await models.Course.findByPk(id);
+      if (!course) return res.status(404).json({ error: 'Course not found' });
+
+      const questions = await models.ExamQuestion.findAll({
+        where: { course_id: id },
+        order: [['question_number', 'ASC']],
+      });
+      if (!questions.length) {
+        return res.status(400).json({ error: 'No exam questions for this course' });
+      }
+
+      const answerKey = questions.map((q) => q.correct_answer_idx);
+      const answerHash = keccak256Buffer(Buffer.from(answerKey));
+      const enrolledCount = await models.Enrollment.count({ where: { course_id: id } });
+      const submittedCount = await models.Submission.count({ where: { course_id: id } });
+
+      res.json({
+        answer_key: answerKey,
+        answer_hash: Array.from(answerHash),
+        answer_hash_hex: answerHash.toString('hex'),
+        enrolled_count: enrolledCount,
+        submitted_count: submittedCount,
+        no_show_count: Math.max(0, enrolledCount - submittedCount),
+      });
+    } catch (error) {
+      console.error('Score prepare error:', error);
+      res.status(500).json({ error: error.message });
+    }
+  }
+
+  /**
+   * Commit phase: run after chain reveal_and_score has succeeded.
+   * Auto-submits no-shows (for the DB leaderboard), scores every submission,
+   * persists ranked results, and flips status to SCORED (3). Idempotent — if
+   * the course is already SCORED we return the existing result set untouched.
+   */
+  async scoreExamCommit(req, res) {
+    try {
+      const { id } = req.params;
+
+      const course = await models.Course.findByPk(id);
+      if (!course) {
+        return res.status(404).json({ error: 'Course not found' });
+      }
+
+      if (course.status >= 3) {
+        const existing = await models.Result.count({ where: { course_id: id } });
+        return res.json({
+          success: true,
+          already_scored: true,
+          scored_count: existing,
+        });
+      }
+
+      const enrollments = await models.Enrollment.findAll({ where: { course_id: id } });
+      const existingSubmissions = await models.Submission.findAll({ where: { course_id: id } });
+      const submittedAddresses = new Set(existingSubmissions.map(s => s.student_address));
+      const questions = await models.ExamQuestion.findAll({
+        where: { course_id: id },
+        order: [['question_number', 'ASC']],
+      });
+
+      const examDeadline = course.exam_deadline ? new Date(course.exam_deadline) : new Date();
+
+      for (const enrollment of enrollments) {
+        if (!submittedAddresses.has(enrollment.student_address)) {
+          const emptyAnswers = questions.map(() => 255);
+          await models.Submission.create({
+            course_id: id,
+            student_address: enrollment.student_address,
+            answers: emptyAnswers,
+            answers_hash: 'auto_submit_no_show',
+            submitted_at: examDeadline,
+            is_auto_submit: true,
+            on_chain_tx_digest: null,
+          });
+        }
+      }
+
+      const answerKey = questions.map(q => q.correct_answer_idx);
+      const totalQuestions = answerKey.length;
+      const answerHash = keccak256Buffer(Buffer.from(answerKey));
+
+      const allSubmissions = await models.Submission.findAll({ where: { course_id: id } });
+      const examStartMs = course.exam_start_time ? new Date(course.exam_start_time).getTime() : null;
+
+      const scored = allSubmissions.map((s) => {
+        const answers = Array.isArray(s.answers) ? s.answers : [];
+        let correct = 0;
+        for (let i = 0; i < totalQuestions; i++) {
+          if (answers[i] === answerKey[i]) correct++;
+        }
+        const percentage = totalQuestions > 0 ? Math.floor((correct * 100) / totalQuestions) : 0;
+        let timeTakenSeconds = s.time_taken_seconds;
+        if (timeTakenSeconds == null) {
+          if (examStartMs && s.submitted_at) {
+            timeTakenSeconds = Math.max(0, Math.floor((new Date(s.submitted_at).getTime() - examStartMs) / 1000));
+          } else {
+            timeTakenSeconds = 0;
+          }
+        }
+        return {
+          student_address: s.student_address,
+          score: correct,
+          percentage,
+          correct_count: correct,
+          total_questions: totalQuestions,
+          time_taken_seconds: timeTakenSeconds,
+        };
+      });
+
+      scored.sort((a, b) => {
+        if (b.score !== a.score) return b.score - a.score;
+        return a.time_taken_seconds - b.time_taken_seconds;
+      });
+
+      const now = new Date();
+      await models.Result.destroy({ where: { course_id: id } });
+      for (let i = 0; i < scored.length; i++) {
+        const r = scored[i];
+        await models.Result.create({
+          course_id: id,
+          student_address: r.student_address,
+          score: r.score,
+          percentage: r.percentage,
+          correct_count: r.correct_count,
+          total_questions: r.total_questions,
+          time_taken_seconds: r.time_taken_seconds,
+          rank_position: i + 1,
+          reward_amount: 0,
+          scored_at: now,
+        });
+      }
+
+      await course.update({ status: 3 });
+
+      broadcastToCourse(id, {
+        type: 'EXAM_SCORED',
+        total_submissions: allSubmissions.length,
+        scored_count: scored.length,
+      });
+      broadcastToAll({ type: 'COURSE_UPDATED', course_id: Number(id), status: 3 });
+
+      res.json({
+        success: true,
+        answer_key: answerKey,
+        answer_hash: Array.from(answerHash),
+        answer_hash_hex: answerHash.toString('hex'),
+        total_submissions: allSubmissions.length,
+        no_show_count: enrollments.length - existingSubmissions.length,
+        scored_count: scored.length,
+      });
+    } catch (error) {
+      console.error('Score exam error:', error);
       res.status(500).json({ error: error.message });
     }
   }

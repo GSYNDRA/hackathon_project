@@ -1,85 +1,82 @@
 const WebSocket = require('ws');
 
-// Store WebSocket connections by course
+// Track every open socket (global channel)
+const allConnections = new Set();
+// Track course-scoped subscribers
 const courseConnections = new Map();
 
-// Initialize WebSocket server
 function initializeWebSocket(server) {
   const wss = new WebSocket.Server({ server });
 
-  wss.on('connection', (ws, req) => {
-    console.log('New WebSocket connection');
-    
-    ws.on('message', (message) => {
+  // Swallow errors that propagate from the underlying HTTP server (e.g.
+  // EADDRINUSE at startup). The HTTP server's own `error` handler prints
+  // a clean message and exits — we just need to prevent the default
+  // "Unhandled 'error' event" crash from masking it.
+  wss.on('error', () => { /* handled on http server */ });
+
+  wss.on('connection', (ws) => {
+    allConnections.add(ws);
+    ws.courseIds = new Set();
+
+    ws.on('message', (raw) => {
+      let data;
       try {
-        const data = JSON.parse(message);
-        
-        if (data.type === 'subscribe' && data.courseId) {
-          // Subscribe to course updates
-          if (!courseConnections.has(data.courseId)) {
-            courseConnections.set(data.courseId, new Set());
-          }
-          courseConnections.get(data.courseId).add(ws);
-          ws.courseId = data.courseId;
-          console.log(`Client subscribed to course ${data.courseId}`);
-          
-          // Send confirmation
-          ws.send(JSON.stringify({
-            type: 'SUBSCRIBED',
-            courseId: data.courseId
-          }));
-        }
-      } catch (error) {
-        console.error('WebSocket message error:', error);
+        data = JSON.parse(raw);
+      } catch {
+        return;
       }
-    });
-    
-    ws.on('close', () => {
-      if (ws.courseId && courseConnections.has(ws.courseId)) {
-        courseConnections.get(ws.courseId).delete(ws);
-        console.log(`Client unsubscribed from course ${ws.courseId}`);
+      // Accept both cases — earlier clients sent uppercase, server used to only handle lowercase.
+      const type = String(data.type || '').toUpperCase();
+
+      if ((type === 'SUBSCRIBE' || type === 'SUB') && data.courseId) {
+        const cid = String(data.courseId);
+        if (!courseConnections.has(cid)) courseConnections.set(cid, new Set());
+        courseConnections.get(cid).add(ws);
+        ws.courseIds.add(cid);
+        ws.send(JSON.stringify({ type: 'SUBSCRIBED', courseId: cid }));
+      } else if (type === 'UNSUBSCRIBE' && data.courseId) {
+        const cid = String(data.courseId);
+        courseConnections.get(cid)?.delete(ws);
+        ws.courseIds.delete(cid);
+      } else if (type === 'PING') {
+        ws.send(JSON.stringify({ type: 'PONG', t: Date.now() }));
       }
     });
 
-    ws.on('error', (error) => {
-      console.error('WebSocket error:', error);
+    ws.on('close', () => {
+      allConnections.delete(ws);
+      for (const cid of ws.courseIds || []) {
+        courseConnections.get(cid)?.delete(ws);
+      }
+    });
+
+    ws.on('error', () => {
+      /* will trigger close */
     });
   });
 
   return wss;
 }
 
-// Broadcast message to all subscribers of a course
-function broadcastToCourse(courseId, message) {
-  if (courseConnections.has(courseId)) {
-    const connections = courseConnections.get(courseId);
-    const messageStr = JSON.stringify(message);
-    
-    connections.forEach((ws) => {
-      if (ws.readyState === WebSocket.OPEN) {
-        ws.send(messageStr);
-      }
-    });
-    
-    console.log(`Broadcast to course ${courseId}: ${message.type}`);
-  }
+function sendTo(ws, messageStr) {
+  if (ws.readyState === WebSocket.OPEN) ws.send(messageStr);
 }
 
-// Broadcast to all connected clients
+function broadcastToCourse(courseId, message) {
+  const subs = courseConnections.get(String(courseId));
+  if (!subs || subs.size === 0) return;
+  const messageStr = JSON.stringify({ ...message, courseId: String(courseId) });
+  subs.forEach((ws) => sendTo(ws, messageStr));
+}
+
+// Global broadcast to every open socket (regardless of course subscription).
 function broadcastToAll(message) {
   const messageStr = JSON.stringify(message);
-  
-  courseConnections.forEach((connections, courseId) => {
-    connections.forEach((ws) => {
-      if (ws.readyState === WebSocket.OPEN) {
-        ws.send(messageStr);
-      }
-    });
-  });
+  allConnections.forEach((ws) => sendTo(ws, messageStr));
 }
 
 module.exports = {
   initializeWebSocket,
   broadcastToCourse,
-  broadcastToAll
+  broadcastToAll,
 };
